@@ -1,11 +1,16 @@
 # # install some dependencies in termial
 # pip install git+https://github.com/huggingface/transformers accelerate
-# pip install qwen-vl-utils[decord]==0.0.8
+# pip install qwen-vl-utils==0.0.8
 
 
 
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
 from qwen_vl_utils import process_vision_info
+
+
+# define the image
+image_path = './Images4Qwen/1.jpg'
+
 
 # default: Load the model on the available device(s)
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -35,7 +40,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                "image": image_path,
             },
             {"type": "text", "text": "Describe this image."},
         ],
