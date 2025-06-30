@@ -53,17 +53,18 @@ for idx,image in enumerate(image_files):
         ]
         # Preparation for inference
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
+        image_inputs, _ = process_vision_info(messages)
         inputs = processor(
             text=[text],
             images=image_inputs,
-            videos=video_inputs,
             padding=True,
             return_tensors="pt",
         )
         inputs = inputs.to("cuda")
         # Inference: Generation of the output
-        generated_ids = model.generate(**inputs, max_new_tokens=128)
+        with torch.no_grad():
+            generated_ids = model.generate(**inputs, max_new_tokens=128)
+            
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
@@ -80,7 +81,7 @@ for idx,image in enumerate(image_files):
     # add to dataset
     dataset.append({
         'img_id': str(idx),
-        'filename': image_file,
+        'filename': image,
         'caption': captions
     })
 
