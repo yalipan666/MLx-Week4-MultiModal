@@ -1,7 +1,6 @@
 qwen-vl-utils==0.0.8
- git+https://github.com/huggingface/transformers
- accelerate
- flash-attn --no-build-isolation
-
+git+https://github.com/huggingface/transformers
+accelerate
+huggingface_hub
 
 

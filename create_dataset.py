@@ -14,8 +14,6 @@ output_json = 'Image_Caption_dataset'
 # We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     "Qwen/Qwen2.5-VL-3B-Instruct",
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
     device_map="auto",
 )
 # default processer
@@ -72,4 +70,22 @@ for idx,image in enumerate(image_files):
         output_text = processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-        captions.append(output_text[0])
+        
+        # ensure a one-sentence output
+        caption_onesentence = re.split(r'(?<=[.!?])\s',output_text[0].strip())[0]
+        captions.append(caption_onesentence) 
+
+
+
+    # add to dataset
+    dataset.append({
+        'img_id': str(idx),
+        'filename': image_file,
+        'caption': captions
+    })
+
+# save out
+with open(output_json, 'w') as f:
+    json.dump(dataset, f, indent=2)
+
+print(f'generated dataset saved to {output_json}')
