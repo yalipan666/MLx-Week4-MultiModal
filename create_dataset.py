@@ -24,7 +24,7 @@ image_files = [f for f in os.listdir(image_dir) if f.lower().endswith(('.jpg','p
 prompts = ['Add a one-sentence caption for this image.',
     'Describe this image in one senence with good enough details.',
     'What is happening in this image?',
-    'Describe this image in one sentence to me as if I were a 5 years old',
+    'Describe this image in one sentence to me as if I were a 5-yers-one',
     'Caption this image in one sentence to include the elements of who, where, when, and doing what'] # 5 difference prompts to encourage a varation when generating captions
 # The default range for the number of visual tokens per image in the model is 4-16384.
 # You can set min_pixels and max_pixels according to your needs, such as a token range of 256-1280, to balance performance and cost.
