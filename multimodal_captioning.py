@@ -228,13 +228,19 @@ for epoch in range(num_epochs): # iterates over epochs
                 vision_embeds = model.proj(vision_outputs)
                 input_ids = torch.full((1, 1), tokenizer.bos_token_id, dtype=torch.long, device=device)
                 generated = input_ids
-                for _ in range(32): 
+                # Prepend vision_embeds ONCE
+                vision_embeds_exp = vision_embeds.unsqueeze(1)
+                finished = torch.zeros((1,), dtype=torch.bool, device=device)
+                for _ in range(32):
                     inputs_embeds = model.decoder.model.embed_tokens(generated)
-                    inputs_embeds = torch.cat([vision_embeds.unsqueeze(1), inputs_embeds], dim=1)
+                    inputs_embeds = torch.cat([vision_embeds_exp, inputs_embeds], dim=1)
                     outputs = model.decoder(inputs_embeds=inputs_embeds)
                     next_token_logits = outputs.logits[:, -1, :]
                     next_token = next_token_logits.argmax(-1, keepdim=True)
                     generated = torch.cat([generated, next_token], dim=1)
+                    # Stop if EOS generated for all
+                    if (next_token == tokenizer.eos_token_id).all():
+                        break
                 caption = tokenizer.batch_decode(generated, skip_special_tokens=True)
                 generated_captions.extend(caption)
             val_predictions.extend(generated_captions)
@@ -289,18 +295,24 @@ with torch.no_grad():
         vision_embeds = model.proj(vision_outputs)
         input_ids = torch.full((pixel_values.size(0), 1), tokenizer.bos_token_id, dtype=torch.long, device=device)
         generated = input_ids
-        # during inference, the next token is generated based on the tokens generated so fa, so it's a causal masking!
-        for _ in range(32): 
+        vision_embeds_exp = vision_embeds.unsqueeze(1)
+        finished = torch.zeros((pixel_values.size(0),), dtype=torch.bool, device=device)
+        for _ in range(32):
             inputs_embeds = model.decoder.model.embed_tokens(generated)
-            inputs_embeds = torch.cat([vision_embeds.unsqueeze(1), inputs_embeds], dim=1)
+            inputs_embeds = torch.cat([vision_embeds_exp, inputs_embeds], dim=1)
             outputs = model.decoder(inputs_embeds=inputs_embeds)
             next_token_logits = outputs.logits[:, -1, :]
             next_token = next_token_logits.argmax(-1, keepdim=True)
             generated = torch.cat([generated, next_token], dim=1)
+            # Stop if EOS generated for all
+            finished |= (next_token.squeeze(1) == tokenizer.eos_token_id)
+            if finished.all():
+                break
         captions = tokenizer.batch_decode(generated, skip_special_tokens=True)
         all_captions.extend(captions)
-        # Reference captions for evaluation
-        all_refs.extend([ex['sentence'] for ex in batch['labels'].cpu().numpy()])
+        # Reference captions for evaluation (decode batch['labels'])
+        references = tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
+        all_refs.extend(references)
     # Print a few generated captions
     print("Sample generated captions:")
     for i in range(3):
