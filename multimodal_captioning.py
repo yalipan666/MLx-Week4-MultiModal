@@ -5,6 +5,7 @@ from datasets import load_dataset
 from transformers import CLIPProcessor, CLIPModel, AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # ignore warnings from huggingface
 import evaluate # for BLEU from huggingface
 import gc
 
@@ -16,7 +17,7 @@ ds = load_dataset("nlphuji/flickr30k")
 # split_counts = Counter(ds['test']['split'])
 # print(split_counts)  # train/val/test: 29000/1014/1000
 ### reduce size
-ds = ds['test'].shuffle(seed=42).select(range(1500))
+ds = ds['test'].shuffle(seed=42).select(range(5000))
 
 
 
@@ -70,7 +71,14 @@ tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base") # to tokenize 
 qwen_model.resize_token_embeddings(len(tokenizer))
 decoder = qwen_model
 for param in decoder.parameters():
-    param.requires_grad = True  # train decoder
+    param.requires_grad = False  
+# only fine-tune the last two layers of QWen
+for block in decoder.model.layers[-2:]:
+    for param in block.parameters():
+        param.requires_grad = True
+
+if tokenizer.bos_token_id is None:
+    tokenizer.bos_token_id = tokenizer.eos_token_id  # or another valid token id
 
 
 # 5. Define a projection layer to map vision features to decoder input; make sure encoder output and decoder input are in the same space before glue them together 
@@ -172,10 +180,13 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = MultimodalCaptionModel(vision_encoder, decoder, vision_feature_dim, decoder_embed_dim).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
+# train/fine-tune the projection layer (project from the visual space to the text space)
+for param in model.proj.parameters():
+    param.requires_grad = True
 
 # 9. Training and validation loops with model saving/loading
-num_epochs = 5  # You can increase this for better results
-save_path = 'multimodal_caption_model_small.pt'
+num_epochs = 10  # You can increase this for better results
+save_path = './YP/multimodal_caption_model_small.pt'
 
 best_val_loss = float('inf')
 # using more metrics
@@ -210,7 +221,22 @@ for epoch in range(num_epochs): # iterates over epochs
             loss = outputs.loss
             val_loss += loss.item() * batch['pixel_values'].size(0)
             # add other metrics
-            generated_captions = tokenizer.batch_decode(outputs.logits[:, -1, :].argmax(-1, keepdim=True), skip_special_tokens=True)
+            generated_captions = []
+            for i in range(batch['pixel_values'].size(0)):
+                pixel_values = batch['pixel_values'][i].unsqueeze(0)
+                vision_outputs = model.vision_encoder(pixel_values)[0][:, 0, :]
+                vision_embeds = model.proj(vision_outputs)
+                input_ids = torch.full((1, 1), tokenizer.bos_token_id, dtype=torch.long, device=device)
+                generated = input_ids
+                for _ in range(32): 
+                    inputs_embeds = model.decoder.model.embed_tokens(generated)
+                    inputs_embeds = torch.cat([vision_embeds.unsqueeze(1), inputs_embeds], dim=1)
+                    outputs = model.decoder(inputs_embeds=inputs_embeds)
+                    next_token_logits = outputs.logits[:, -1, :]
+                    next_token = next_token_logits.argmax(-1, keepdim=True)
+                    generated = torch.cat([generated, next_token], dim=1)
+                caption = tokenizer.batch_decode(generated, skip_special_tokens=True)
+                generated_captions.extend(caption)
             val_predictions.extend(generated_captions)
             references = tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
             val_references.extend(references)
@@ -219,7 +245,7 @@ for epoch in range(num_epochs): # iterates over epochs
 
     # Print 5 sample predictions and references for debugging
     print("Sample predictions and references:")
-    for pred, ref in zip(val_predictions[:5], val_references[:5]):
+    for pred, ref in zip(val_predictions[:10], val_references[:10]):
         print(f"Pred: {pred}")
         print(f"Ref: {ref}")
         print("---")
