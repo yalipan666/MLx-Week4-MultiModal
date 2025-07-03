@@ -5,7 +5,8 @@ from datasets import load_dataset
 from transformers import CLIPProcessor, CLIPModel, AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import os
-import evaluate 
+import evaluate # for BLEU from huggingface
+import gc
 
 
 # 1. Load the Flickr30k dataset from Hugging Face
@@ -14,6 +15,10 @@ ds = load_dataset("nlphuji/flickr30k")
 # from collections import Counter
 # split_counts = Counter(ds['test']['split'])
 # print(split_counts)  # train/val/test: 29000/1014/1000
+### reduce size
+ds = ds['test'].shuffle(seed=42).select(range(1500))
+
+
 
 # because now for each row we have one image and 5 captions, we want to flatten it to 5 rows/pairs of image+caption
 def flatten_dataset(batch):
@@ -38,13 +43,13 @@ def flatten_dataset(batch):
         'split': splits, 'img_id': img_ids, 'filename': filenames
         }
 
-flat_ds = ds['test'].map(flatten_dataset, batched=True)
+flat_ds = ds.map(flatten_dataset, batched=True)
     
 
 # 2. Split the dataset into train:val:test according to the pre-defined column of 'split' in the huggingface dataset
-train_ds = flat_ds.filter(lambda d: d['split']=='train')
-val_ds = flat_ds.filter(lambda d: d['split']=='val')
-test_ds = flat_ds.filter(lambda d: d['split']=='test')
+train_ds_1 = flat_ds.filter(lambda d: d['split']=='train')
+val_ds_1 = flat_ds.filter(lambda d: d['split']=='val')
+test_ds_1 = flat_ds.filter(lambda d: d['split']=='test')
 
 
 # 3. Load CLIP's vision encoder and processor
@@ -61,14 +66,16 @@ for param in vision_encoder.parameters():
 # 4. Load QWen's decoder and tokenizer
 qwen_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B-Base") # QWen is a generative model, same as GPT, so it only has decoder no encoder, the entire model is a decoder
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base") # to tokenize the captions/text
-decoder = qwen_model.model
+# resize the tokenizer to make sure the dimension matches
+qwen_model.resize_token_embeddings(len(tokenizer))
+decoder = qwen_model
 for param in decoder.parameters():
     param.requires_grad = True  # train decoder
 
 
 # 5. Define a projection layer to map vision features to decoder input; make sure encoder output and decoder input are in the same space before glue them together 
 vision_feature_dim = vision_encoder.config.hidden_size
-decoder_embed_dim = decoder.embed_tokens.embedding_dim
+decoder_embed_dim = decoder.model.embed_tokens.embedding_dim
 ### build the architecture
 class MultimodalCaptionModel(nn.Module):
     # define the architecture of this neural net, sets up the layers and parameters
@@ -86,7 +93,7 @@ class MultimodalCaptionModel(nn.Module):
         vision_embeds = self.proj(vision_outputs)
         # Use vision_embeds as prefix for decoder
         # Concatenate vision_embeds to input embeddings
-        inputs_embeds = self.decoder.embed_tokens(input_ids)
+        inputs_embeds = self.decoder.model.embed_tokens(input_ids)
         # Prepend vision_embeds to the sequence
         vision_embeds = vision_embeds.unsqueeze(1)  # (batch, 1, embed_dim)
         inputs_embeds = torch.cat([vision_embeds, inputs_embeds], dim=1) # the vision feature (CLS token) is prepended to the text embeddings
@@ -95,9 +102,22 @@ class MultimodalCaptionModel(nn.Module):
             vision_mask = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=attention_mask.device)
             attention_mask = torch.cat([vision_mask, attention_mask], dim=1) # vision feature is prepended to text feature, same for its mask
         # Forward through decoder
-        outputs = self.decoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
-        # Here, the model uses the labels argument, and the causal mask is applied internally by the model.
-        return outputs
+        outputs = self.decoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+
+        # calculate the loss manually, as the decoder doesn't have it unless we call the whole model
+        logits = outputs[0]
+        # shift logits and labels for causal loss
+        shift_logits = logits[:,1:-1,:].contiguous() # ignore vision embed and last token
+        shift_labels = labels[:,:-1].contiguous() # ignore the last label
+        loss_fct = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+        loss = loss_fct(shift_logits.view(-1,shift_logits.size(-1)), shift_labels.view(-1))
+        # Return a simple object with .logits and .loss attributes
+        class Output:
+            pass
+        out = Output()
+        out.logits = logits
+        out.loss = loss
+        return out
 
 
 # 6. Preprocessing function for dataset
@@ -123,31 +143,30 @@ def preprocess(example):
     }
 
 
-# 7. Apply preprocessing to datasets
-# train_ds = train_ds.map(preprocess)
-# val_ds = val_ds.map(preprocess)
-# test_ds = test_ds.map(preprocess)
-
-### reduce size
-train_ds = train_ds.select(range(14500)).map(preprocess)
-val_ds = val_ds.select(range(507)).map(preprocess)
-test_ds = test_ds.select(range(500)).map(preprocess)
+# 7. Apply preprocessing to datasets; will always convert data to a list for serialization and storage
+train_ds = train_ds_1.map(preprocess, load_from_cache_file=False)
+val_ds = val_ds_1.map(preprocess, load_from_cache_file=False)
+test_ds = test_ds_1.map(preprocess, load_from_cache_file=False)
 
 
 # 8. DataLoader
-batch_size = 16
+batch_size = 32
 # convert a list of individual tensors into a single batched tensor; add the stack axis as the first dimension
 def collate_fn(batch):
+    def to_tensor(x):
+        if isinstance(x, torch.Tensor):
+            return x
+        return torch.tensor(x)
     return {
-        'pixel_values': torch.stack([x['pixel_values'] for x in batch]),
-        'input_ids': torch.stack([x['input_ids'] for x in batch]),
-        'attention_mask': torch.stack([x['attention_mask'] for x in batch]),
-        'labels': torch.stack([x['labels'] for x in batch]),
+        'pixel_values': torch.stack([to_tensor(x['pixel_values']) for x in batch]),
+        'input_ids': torch.stack([to_tensor(x['input_ids']) for x in batch]),
+        'attention_mask': torch.stack([to_tensor(x['attention_mask']) for x in batch]),
+        'labels': torch.stack([to_tensor(x['labels']) for x in batch]),
     }
 # shuffle samples for training to aviod model learn the order of samples, which is useless
-train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,num_workers=4, pin_memory=True)
 # not shuffle samples to ensure the same validation dataset for each epoch, to make the comparison between epochs fair
-val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,num_workers=4, pin_memory=True)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = MultimodalCaptionModel(vision_encoder, decoder, vision_feature_dim, decoder_embed_dim).to(device)
@@ -156,11 +175,10 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
 # 9. Training and validation loops with model saving/loading
 num_epochs = 5  # You can increase this for better results
-save_path = 'multimodal_caption_model.pt'
+save_path = 'multimodal_caption_model_small.pt'
 
 best_val_loss = float('inf')
 # using more metrics
-cider_metric = evaluate.load('cider')
 bleu_metric = evaluate.load('bleu')
 
 for epoch in range(num_epochs): # iterates over epochs
@@ -194,9 +212,21 @@ for epoch in range(num_epochs): # iterates over epochs
             # add other metrics
             generated_captions = tokenizer.batch_decode(outputs.logits[:, -1, :].argmax(-1, keepdim=True), skip_special_tokens=True)
             val_predictions.extend(generated_captions)
-            val_references.extend([ex['sentence'] for ex in batch['labels'].cpu().numpy()])
+            references = tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
+            val_references.extend(references)
     val_loss /= len(val_loader.dataset)
     print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+
+    # Print 5 sample predictions and references for debugging
+    print("Sample predictions and references:")
+    for pred, ref in zip(val_predictions[:5], val_references[:5]):
+        print(f"Pred: {pred}")
+        print(f"Ref: {ref}")
+        print("---")
+
+    # BLEU expects references as list of lists of tokens
+    bleu_score = bleu_metric.compute(predictions=val_predictions, references=[[ref] for ref in val_references])['bleu']
+    print(f"Validation BLEU: {bleu_score:.4f}")
 
     # Save the best model  -- Smart!
     if val_loss < best_val_loss:
@@ -204,18 +234,23 @@ for epoch in range(num_epochs): # iterates over epochs
         torch.save(model.state_dict(), save_path)
         print(f"Best model saved at epoch {epoch+1} with val loss {val_loss:.4f}")
 
-    # BLEU expects references as list of lists of tokens
-    bleu_score = bleu_metric.compute(predictions=val_predictions, references=[[ref] for ref in val_references])['bleu']
-    # CIDEr expects references as list of lists of strings
-    cider_score = cider_metric.compute(predictions=val_predictions, references=[[ref] for ref in val_references])['cider']
-    print(f"Validation BLEU: {bleu_score:.4f}, CIDEr: {cider_score:.4f}")
-
 # Load the best model for testing
 if os.path.exists(save_path):
     model.load_state_dict(torch.load(save_path, map_location=device))
     print(f"Loaded best model from {save_path}")
 else:
     print("No saved model found, using last epoch model.")
+
+# After dataset preparation, free up the original datasets
+
+del ds
+gc.collect()
+
+# After training and validation, before test evaluation
+
+del train_ds, val_ds, train_ds_1, val_ds_1, train_loader, val_loader
+
+gc.collect()
 
 # 10. Test: generate captions for test images
 model.eval()
@@ -230,7 +265,7 @@ with torch.no_grad():
         generated = input_ids
         # during inference, the next token is generated based on the tokens generated so fa, so it's a causal masking!
         for _ in range(32): 
-            inputs_embeds = model.decoder.embed_tokens(generated)
+            inputs_embeds = model.decoder.model.embed_tokens(generated)
             inputs_embeds = torch.cat([vision_embeds.unsqueeze(1), inputs_embeds], dim=1)
             outputs = model.decoder(inputs_embeds=inputs_embeds)
             next_token_logits = outputs.logits[:, -1, :]
@@ -247,10 +282,13 @@ with torch.no_grad():
 
 # Prepare references for metrics
 # If you have only one reference per image:
-references = [[ref] for ref in all_refs]  # BLEU/CIDEr expect list of lists
+references = [[ref] for ref in all_refs]  # BLEU expect list of lists
 # Compute BLEU
 bleu_score = bleu_metric.compute(predictions=all_captions, references=references)['bleu']
-# Compute CIDEr
-cider_score = cider_metric.compute(predictions=all_captions, references=references)['cider']
 print(f"Test BLEU: {bleu_score:.4f}")
-print(f"Test CIDEr: {cider_score:.4f}")
+
+# After test evaluation, free up test data and model
+
+del test_ds, test_ds_1, flat_ds, model, decoder, vision_encoder, clip_model, qwen_model, tokenizer, clip_processor
+
+gc.collect()
